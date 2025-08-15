@@ -44,11 +44,6 @@ class MyHandler(BaseHTTPRequestHandler):
         feed_algorithm(url)
     
 
-
-#    def log_message(self, format, *args):
-#        # Override to suppress default console logging (optional)
-#        return
-
 def run():
     server = HTTPServer((HOST, PORT), MyHandler)
     print(f"Serving on http://{HOST}:{PORT}")
@@ -98,18 +93,16 @@ def get_driver():
     
     options.binary_location = "/usr/bin/chromium"  # Adjust path if needed (e.g., "chromium-browser")
     
-    # ✅ Set the user data directory (your Chromium profile)
     user_data_dir = os.path.expanduser("~/.config/chromium")  # Default location on Linux
     options.add_argument(f"--user-data-dir={user_data_dir}")
     
-    # ✅ Choose the specific profile folder
-    options.add_argument("--profile-directory=Default")  # Or "Profile 1", etc.
+    options.add_argument("--profile-directory=Default") 
 
-    options.add_argument("--headless=new")  # "new" headless mode for Chrome 109+
-    options.add_argument("--disable-gpu")   # for older systems
-    options.add_argument("--no-sandbox")    # sometimes needed in containers
+    options.add_argument("--headless=new")  
+    options.add_argument("--disable-gpu")   
+    options.add_argument("--no-sandbox")    
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")  # optional, fixes rendering issues
+    options.add_argument("--window-size=1920,1080")  
     driver = webdriver.Chrome(options=options)
     return driver
 
