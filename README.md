@@ -1,7 +1,6 @@
 Requirements:
-Selenium
-BeautifulSoup
-Patience*
+
+Selenium, BeautifulSoup, Patience*
 
 
 *not a software component
