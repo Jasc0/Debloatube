@@ -5,12 +5,15 @@ from selenium.webdriver.chrome.service import Service
 import time
 import json
 import os
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
+import sqlite3
+import threading
 
+DB_PATH = "./debloatube.db"
 HOST = "0.0.0.0"
 PORT = 8080
-in_use = False
+in_use = threading.Lock()
 
 ### Server ###
 class MyHandler(BaseHTTPRequestHandler):
@@ -22,7 +25,9 @@ class MyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/html")
         self.end_headers()
         if self.path == "/":
-            self.wfile.write(bytes(get_html(get_homepage()),"UTF-8"))
+            self.wfile.write(bytes(get_html(get_vids_from_sql()),"UTF-8"))
+            t = threading.Thread(target=get_homepage)
+            t.start()
         elif self.path.startswith("/search"):
             query = self.path.split("=")[1]
             self.wfile.write(bytes(get_html(get_search(query)),"UTF-8"))
@@ -32,20 +37,31 @@ class MyHandler(BaseHTTPRequestHandler):
         elif self.path.endswith(".ico") or self.path.endswith(".png"):
             with open("."+self.path,"rb") as f:
                 self.wfile.write(f.read())
+        elif self.path.startswith("/new"):
+            self.wfile.write(bytes(get_html(get_homepage()),"UTF-8"))
     def do_POST(self):
         # Get length of the data
         content_length = int(self.headers.get('Content-Length', 0))
         # Read POST data
         post_data = self.rfile.read(content_length).decode()
         params = parse_qs(post_data)
-        url = params.get('url', [''])[0]
+        if self.path.endswith("/feed"):
+            url = params.get('url', [''])[0]
+            feed_algorithm(url)
+        elif self.path.endswith("/hide"):
+            id = params.get('video_id', [''])[0]
+            print(id)
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE stored_videos SET hidden = TRUE WHERE id = (?)",(id,))
+            conn.commit()
+            conn.close()
         self.send_response(200)
         self.end_headers()   
-        feed_algorithm(url)
     
 
 def run():
-    server = HTTPServer((HOST, PORT), MyHandler)
+    server = ThreadingHTTPServer((HOST, PORT), MyHandler)
     print(f"Serving on http://{HOST}:{PORT}")
     try:
         server.serve_forever()
@@ -60,9 +76,9 @@ def feed_algorithm(url, load_time=5):
     driver = get_driver()
     driver.get(url)
     time.sleep(load_time)
-    global in_use
-    in_use = False
     driver.close()
+    global in_use
+    in_use.release()
 ### Scraping ###
 def auto_scroll(driver, pause_time=0.5, max_scrolls=2):
     last_height = driver.execute_script("return document.documentElement.scrollHeight")
@@ -85,9 +101,7 @@ def auto_scroll(driver, pause_time=0.5, max_scrolls=2):
         last_height = new_height
 def get_driver():
     global in_use
-    while in_use:
-        time.sleep(1)
-    in_use = True
+    in_use.acquire()
     options = Options()
     options.add_argument("Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.35 Mobile Safari/537.36")
     
@@ -105,8 +119,23 @@ def get_driver():
     options.add_argument("--window-size=1920,1080")  
     driver = webdriver.Chrome(options=options)
     return driver
-
+def get_vids_from_sql(query="SELECT * FROM stored_videos WHERE hidden = FALSE ORDER BY added DESC"):
+    videos = []
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    for id, url, title, channel, thumbnail, timestamp, hidden in rows:
+        videos.append({
+            "url": url,
+            "title": title,
+            "author": channel,    # channel -> author
+            "img": thumbnail      # thumbnail -> img
+        })
+    return videos
 def get_homepage():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     driver = get_driver()
     videos = []
     driver.get("https://www.youtube.com")
@@ -140,7 +169,19 @@ def get_homepage():
             continue
     driver.close()
     global in_use 
-    in_use = False
+    in_use.release()
+    for v in videos:
+        cursor.execute("INSERT OR IGNORE INTO stored_videos VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (v['url'].split("=")[1],v['url'],v['title'],v['author'],v['img'], int(time.time()), False ))
+       
+        # id TEXT PRIMARY KEY,
+        # url TEXT NOT NULL,
+        # title TEXT,
+        # channel TEXT,
+        # thumbnail TEXT
+    conn.commit()
+    conn.close()
+        
     return videos
 
 def get_search(query):
@@ -181,7 +222,7 @@ def get_search(query):
             continue
     driver.close()
     global in_use 
-    in_use = False
+    in_use.release()
     return videos
 
 def get_channel(channel):
@@ -217,7 +258,7 @@ def get_channel(channel):
             continue
     driver.close()
     global in_use 
-    in_use = False
+    in_use.release()
     return videos
 
 
@@ -323,6 +364,7 @@ def get_html(videos):
         ret_str += "</div>"
         ret_str += "<a href=\"/channel/"+ v["author"]+"\"><div class=\"card-author\">"+v["author"]+"</div></a>"
         ret_str += "<button data-body=\"" + v["url"] + "\" class=\"post-btn\">Feed algorithm</button>"
+        ret_str += "<button data-body=\"" + v["url"].split("=")[1] + "\" class=\"hide-btn\">Hide Video</button>"
         ret_str += "</div>"
 
 
@@ -385,6 +427,7 @@ def get_html(videos):
             flash.remove();
         }, 300);
     }
+    // feed algorithm button
     document.querySelectorAll('.post-btn').forEach(button => {
       button.onclick = () => {
         const body = 'url=' + encodeURIComponent(button.dataset.body);
@@ -395,6 +438,23 @@ def get_html(videos):
         }).catch(console.error);
       };
     });
+
+    // hide button
+    document.querySelectorAll('.hide-btn').forEach(button => {
+      button.onclick = () => {
+        const body = 'video_id=' + encodeURIComponent(button.dataset.body);
+        fetch('/hide', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: body
+        }).catch(console.error).then(() => {location.reload();});
+      };
+    });
+    // autorefresh
+  setInterval(() => {
+    location.reload();
+        }, 300000); // 300,000 ms = 5 minutes
+
       </script>
     
     </body>
@@ -404,6 +464,20 @@ def get_html(videos):
     return ret_str
 
 if __name__ == "__main__":
-    in_use = False
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+                   CREATE TABLE IF NOT EXISTS stored_videos (
+                       id TEXT PRIMARY KEY,
+                       url TEXT NOT NULL,
+                       title TEXT,
+                       author TEXT,
+                       thumbnail TEXT,
+                       added INTEGER,
+                       hidden BOOLEAN
+                       )
+                   """)
+    conn.commit()
+    conn.close()
     run()
 
