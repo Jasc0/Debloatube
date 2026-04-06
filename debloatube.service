@@ -1,0 +1,13 @@
+[Unit]
+Description=Run My Command After Network is Up
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/home/jake/Build/Debloatube
+Type=simple
+ExecStart=/home/jake/Build/Debloatube/debloatube.sh
+
+[Install]
+WantedBy=multi-user.target
+

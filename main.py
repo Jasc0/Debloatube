@@ -134,8 +134,8 @@ def get_driver():
 
     options.binary_location = "/usr/bin/chromium"  # Adjust path if needed (e.g., "chromium-browser")
 
-    #user_data_dir = os.path.expanduser("/home/jake/.config/chromium")  # Default location on Linux
-    user_data_dir = "/home/jake/.config/chromium"  # Default location on Linux
+    HOME = os.environ["HOME"]
+    user_data_dir = f"{HOME}/.config/chromium"  # Default location on Linux
     options.add_argument(f"--user-data-dir={user_data_dir}")
 
     options.add_argument("--profile-directory=Default") 
@@ -194,7 +194,7 @@ def get_homepage():
             url = url_tag.strip().split("&")[0] if url_tag else "N/A"
             thumbnail_url = "https://i.ytimg.com/vi/" + url.split("=")[1] + "/hqdefault.jpg"
             uploaded = "unknown"
-            uploaded_tags = vid.find_all("span",{'class': 'yt-core-attributed-string yt-content-metadata-view-model__metadata-text yt-core-attributed-string--white-space-pre-wrap yt-core-attributed-string--link-inherit-color'})
+            uploaded_tags = vid.find_all("span",{'class': 'yt-core-attributed-string ytContentMetadataViewModelMetadataText yt-core-attributed-string--white-space-pre-wrap yt-core-attributed-string--link-inherit-color'})
             for ut in uploaded_tags:
                 text = ut.get_text(strip=True)
                 if "ago" in text:
