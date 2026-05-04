@@ -1,54 +1,69 @@
 from selenium import webdriver
 from bs4 import BeautifulSoup
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 import time
-import json
+import html as html_mod
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse, quote_plus
 import sqlite3
 import threading
+
 
 DB_PATH = "./debloatube.db"
 HOST = "0.0.0.0"
 PORT = 8080
+DEBUG = False
 in_use = threading.Lock()
 
 ### Server ###
 class MyHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        # Send response status code
-        self.send_response(200)
+    def log_message(self, format, *args):
+        print(f"[{self.address_string()}] " + format % args)
 
-        # Send headers
+    def _send_html(self, content, status=200):
+        self.send_response(status)
         self.send_header("Content-type", "text/html")
         self.end_headers()
-        if self.path == "/":
-            self.wfile.write(bytes(get_html(get_vids_from_sql()),"UTF-8"))
-            t = threading.Thread(target=get_homepage)
+        self.wfile.write(bytes(content, "UTF-8"))
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+
+        if path == "/":
+            self._send_html(get_html(get_vids_from_sql()))
+            t = threading.Thread(target=get_homepage, daemon=True)
             t.start()
-            t.join()
-        elif self.path.startswith("/watch_later"):
-            query = """
+        elif path == "/watch_later":
+            sql = """
             SELECT t1.*
             FROM stored_videos AS t1
             INNER JOIN watch_later AS t2
                 ON t1.id = t2.id
             ORDER BY t2.added DESC;
             """
-            self.wfile.write(bytes(get_html(get_vids_from_sql(query), hide_video_btn=False, show_remove_from_watch_later_btn=True),"UTF-8"))
-        elif self.path.startswith("/search"):
-            query = self.path.split("=")[1]
-            self.wfile.write(bytes(get_html(get_search(query), hide_video_btn=False),"UTF-8"))
-        elif self.path.startswith("/channel/"):
-            query = self.path.split("/")[2]
-            self.wfile.write(bytes(get_html(get_channel(query), show_author=False, hide_video_btn=False),"UTF-8"))
-        elif self.path.endswith(".ico") or self.path.endswith(".png"):
-            with open("."+self.path,"rb") as f:
-                self.wfile.write(f.read())
-        elif self.path.startswith("/new"):
-            self.wfile.write(bytes(get_html(get_homepage()),"UTF-8"))
+            self._send_html(get_html(get_vids_from_sql(sql), hide_video_btn=False, show_remove_from_watch_later_btn=True))
+        elif path == "/search":
+            query = parse_qs(parsed.query).get('q', [''])[0]
+            self._send_html(get_html(get_search(query), hide_video_btn=False))
+        elif path.startswith("/channel/"):
+            channel = path.split("/")[2]
+            self._send_html(get_html(get_channel(channel), show_author=False, hide_video_btn=False))
+        elif path.endswith(".ico") or path.endswith(".png"):
+            try:
+                with open("." + path, "rb") as f:
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(f.read())
+            except FileNotFoundError:
+                self.send_response(404)
+                self.end_headers()
+        else:
+            self.send_response(404)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"404 Not Found")
     def do_POST(self):
         # Get length of the data
         content_length = int(self.headers.get('Content-Length', 0))
@@ -100,11 +115,12 @@ def run():
 def feed_algorithm(url, load_time=5):
     print("feeding the algorithm: " + url)
     driver = get_driver()
-    driver.get(url)
-    time.sleep(load_time)
-    driver.close()
-    global in_use
-    in_use.release()
+    try:
+        driver.get(url)
+        time.sleep(load_time)
+    finally:
+        driver.quit()
+        in_use.release()
 ### Scraping ###
 def auto_scroll(driver, pause_time=0.5, max_scrolls=2):
     last_height = driver.execute_script("return document.documentElement.scrollHeight")
@@ -130,7 +146,7 @@ def get_driver():
     global in_use
     in_use.acquire()
     options = Options()
-    options.add_argument("Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.35 Mobile Safari/537.36")
+    options.add_argument("--user-agent=Mozilla/5.0 (Linux; Android 13; Pixel 7 Pro) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.7204.35 Mobile Safari/537.36")
 
     options.binary_location = "/usr/bin/chromium"  # Adjust path if needed (e.g., "chromium-browser")
 
@@ -169,45 +185,56 @@ def get_homepage():
     cursor = conn.cursor()
     driver = get_driver()
     videos = []
-    driver.get("https://www.youtube.com")
-    auto_scroll(driver)
+    try:
+        driver.get("https://www.youtube.com")
+        auto_scroll(driver)
 
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-    with open("scrape.html", "w") as f:
-        f.write(soup.prettify())
-    vids = soup.find_all("ytd-rich-item-renderer", {
-        "class": "style-scope ytd-rich-grid-renderer"
-        })
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        if DEBUG:
+            with open("scrape.html", "w") as f:
+                f.write(soup.prettify())
+        vids = soup.find_all("ytm-rich-item-renderer")
 
-    for vid in vids:
-        try:
-            link = vid.find('a', {
-                "aria-haspopup": "false",
-                'class': 'yt-lockup-metadata-view-model__title'
-                })
+        for vid in vids:
+            try:
+                url_tag = vid.find("a", {"class": "media-item-thumbnail-container"})
+                if not url_tag:
+                    continue
+                url = url_tag["href"].split("&")[0]
+                if "shorts" in url or "/watch" not in url:
+                    continue
 
-            author_tag = vid.find("a",{'class': 'yt-core-attributed-string__link yt-core-attributed-string__link--call-to-action-color yt-core-attributed-string--link-inherit-color'} ) 
-            author = author_tag['href'].split('@')[1] if author_tag.has_attr("href") and "@" in author_tag['href'] else "DNF"
-            title_tag = link["aria-label"]
-            title = title_tag.strip() if title_tag else "N/A"
-            url_tag = link["href"]
-            url = url_tag.strip().split("&")[0] if url_tag else "N/A"
-            thumbnail_url = "https://i.ytimg.com/vi/" + url.split("=")[1] + "/hqdefault.jpg"
-            uploaded = "unknown"
-            uploaded_tags = vid.find_all("span",{'class': 'yt-core-attributed-string ytContentMetadataViewModelMetadataText yt-core-attributed-string--white-space-pre-wrap yt-core-attributed-string--link-inherit-color'})
-            for ut in uploaded_tags:
-                text = ut.get_text(strip=True)
-                if "ago" in text:
-                    uploaded = text
+                thumbnail_url = "https://i.ytimg.com/vi/" + url.split("=")[1] + "/hqdefault.jpg"
 
-            vid = {"title": title, "url": "https://www.youtube.com" + url, "img": thumbnail_url, "author":author, 'uploaded':uploaded}
-            videos.append(vid)
-        except:
-            print("error with video: "+ vid.prettify())
-            continue
-    driver.close()
-    global in_use 
-    in_use.release()
+                headline = vid.find("h3", {"class": "media-item-headline"})
+                title = headline.get_text(strip=True) if headline else "N/A"
+
+                duration_tag = vid.find("div", {"class": "ytBadgeShapeText"})
+                if duration_tag:
+                    title += " [" + duration_tag.get_text(strip=True) + "]"
+
+                author = "DNF"
+                channel_tag = vid.find("ytm-channel-thumbnail-with-link-renderer")
+                if channel_tag:
+                    a = channel_tag.find("a")
+                    if a and a.get("href", "").startswith("/@"):
+                        author = a["href"].split("/@")[1]
+
+                uploaded = "unknown"
+                for span in vid.find_all("span", {"class": "YtmBadgeAndBylineRendererItemByline"}):
+                    text = span.get_text(strip=True)
+                    if "ago" in text:
+                        uploaded = text
+                        break
+
+                vid = {"title": title, "url": "https://www.youtube.com" + url, "img": thumbnail_url, "author": author, 'uploaded': uploaded}
+                videos.append(vid)
+            except Exception as e:
+                print(f"error parsing video: {e}")
+                continue
+    finally:
+        driver.quit()
+        in_use.release()
     for v in videos:
         cursor.execute("INSERT OR REPLACE INTO stored_videos VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                        (v['url'].split("=")[1],v['url'],v['title'],v['author'],v['img'], int(time.time()), False, v['uploaded'] ))
@@ -225,90 +252,101 @@ def get_homepage():
 def get_search(query):
     driver = get_driver()
     videos = []
-    driver.get("https://www.youtube.com/results?search_query=" + query)
-    auto_scroll(driver)
+    try:
+        driver.get("https://www.youtube.com/results?search_query=" + quote_plus(query))
+        auto_scroll(driver)
 
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-    with open("scrape.html", "w") as f:
-        f.write(soup.prettify())
-    video_tags = soup.find_all("ytd-video-renderer")
-    for v in video_tags:
-        try:
-            author = "DNF"
-            url = "/"
-            title = ""
-            thumbnail_url = "/"
-            uploaded = "unknown"
-
-            author_tag = v.find("a",{"class":"yt-simple-endpoint style-scope yt-formatted-string"})
-            if author_tag:
-                author = author_tag["href"].split("@")[1]
-            url_tag = v.find("a",{"class":"yt-simple-endpoint style-scope ytd-video-renderer"})
-            if url_tag:
-                url = url_tag["href"].split("&")[0]
-                if "shorts" in url:
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        if DEBUG:
+            with open("search_scrape.html", "w") as f:
+                f.write(soup.prettify())
+        video_tags = soup.find_all("ytm-video-with-context-renderer")
+        print(f"search found {len(video_tags)} ytm-video-with-context-renderer tags")
+        for v in video_tags:
+            try:
+                url_tag = v.find("a", {"class": "media-item-thumbnail-container"})
+                if not url_tag:
+                    continue
+                url = url_tag.get("href", "").split("&")[0]
+                if "shorts" in url or "/watch" not in url:
                     continue
 
                 thumbnail_url = "https://i.ytimg.com/vi/" + url.split("=")[1] + "/hq720.jpg"
-            if url_tag:
-                title_tag = url_tag.find("yt-formatted-string")
-                if title_tag:
-                    title = title_tag["aria-label"]
-            uploaded_tags = v.find_all("span",{'class':'inline-metadata-item style-scope ytd-video-meta-block'})
-            for ut in uploaded_tags:
-                text = ut.get_text(strip=True)
-                if "ago" in text:
-                    uploaded = text
-            vid = {"title": title, "url": "https://www.youtube.com" + url, "img": thumbnail_url, "author":author, 'uploaded':uploaded}
-            videos.append(vid)
-        except:
-            print("error with video: "+ v.prettify())
-            continue
-    driver.close()
-    global in_use 
-    in_use.release()
+
+                headline = v.find("h3", {"class": "media-item-headline"})
+                title = headline.get_text(strip=True) if headline else "N/A"
+
+                duration_tag = v.find("div", {"class": "ytBadgeShapeText"})
+                if duration_tag:
+                    title += " [" + duration_tag.get_text(strip=True) + "]"
+
+                author = "DNF"
+                channel_tag = v.find("ytm-channel-thumbnail-with-link-renderer")
+                if channel_tag:
+                    a = channel_tag.find("a")
+                    if a and a.get("href", "").startswith("/@"):
+                        author = a["href"].split("/@")[1]
+
+                uploaded = "unknown"
+                for span in v.find_all("span", {"class": "YtmBadgeAndBylineRendererItemByline"}):
+                    text = span.get_text(strip=True)
+                    if "ago" in text:
+                        uploaded = text
+                        break
+
+                vid = {"title": title, "url": "https://www.youtube.com" + url, "img": thumbnail_url, "author": author, 'uploaded': uploaded}
+                videos.append(vid)
+            except Exception as e:
+                print(f"error parsing video: {e}")
+                continue
+    finally:
+        driver.quit()
+        in_use.release()
     return videos
 
 def get_channel(channel):
     driver = get_driver()
     videos = []
-    driver.get("https://www.youtube.com/@" + channel +"/videos")
-    auto_scroll(driver)
+    try:
+        driver.get("https://www.youtube.com/@" + channel + "/videos")
+        auto_scroll(driver)
 
-    soup = BeautifulSoup(driver.page_source, 'html.parser')
-    with open("scrape.html", "w") as f:
-        f.write(soup.prettify())
-    video_tags = soup.find_all("ytd-rich-item-renderer")
-    for v in video_tags:
-        try:
-            author = channel
-            url = "/"
-            title = ""
-            thumbnail_url = "/"
-            uploaded = "unknown"
-
-            url_tag = v.find("a",{"class":"yt-simple-endpoint focus-on-expand style-scope ytd-rich-grid-media"})
-            if url_tag:
-                url = url_tag["href"]
-                if "shorts" in url:
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        if DEBUG:
+            with open("scrape.html", "w") as f:
+                f.write(soup.prettify())
+        video_tags = soup.find_all("ytm-compact-video-renderer")
+        for v in video_tags:
+            try:
+                url_tag = v.find("a", {"class": "YtmCompactMediaItemImage"})
+                if not url_tag:
+                    continue
+                url = url_tag.get("href", "").split("&")[0]
+                if "shorts" in url or "/watch" not in url:
                     continue
 
                 thumbnail_url = "https://i.ytimg.com/vi/" + url.split("=")[1] + "/hq720.jpg"
-            if url_tag and url_tag.has_attr("aria-label"):
-                title = url_tag["aria-label"]
-            uploaded_tags = v.find_all("span",{'class': 'inline-metadata-item style-scope ytd-video-meta-block'})
-            for ut in uploaded_tags:
-                text = ut.get_text(strip=True)
-                if "ago" in text:
-                    uploaded = text
-            vid = {"title": title, "url": "https://www.youtube.com" + url, "img": thumbnail_url, "author":author, 'uploaded':uploaded}
-            videos.append(vid)
-        except:
-            print("error with video: "+ v.prettify())
-            continue
-    driver.close()
-    global in_use 
-    in_use.release()
+
+                headline = v.find("h4", {"class": "YtmCompactMediaItemHeadline"})
+                title = headline.get_text(strip=True) if headline else "N/A"
+
+                duration_tag = v.find("div", {"class": "ytBadgeShapeText"})
+                if duration_tag:
+                    title += " [" + duration_tag.get_text(strip=True) + "]"
+
+                uploaded = "unknown"
+                stats = v.find_all("div", {"class": "YtmCompactMediaItemStats"})
+                if len(stats) >= 2:
+                    uploaded = stats[1].get_text(strip=True)
+
+                vid = {"title": title, "url": "https://www.youtube.com" + url, "img": thumbnail_url, "author": channel, 'uploaded': uploaded}
+                videos.append(vid)
+            except Exception as e:
+                print(f"error parsing video: {e}")
+                continue
+    finally:
+        driver.quit()
+        in_use.release()
     return videos
 
 
@@ -584,32 +622,45 @@ def get_html(videos, feed_algorithm_btn=True, hide_video_btn=True, show_author=T
     </div>
     <div class="navbar-right">
         <a href="/watch_later" class="nav-btn">Watch Later</a>
-        <a href="/new" class="nav-btn">New</a>
     </div>
   </div>
       <div id="flash"></div>
       <div class="grid">
     """
     for v in videos:
+        title = v["title"]
+        duration = ""
+        if title.endswith("]") and "[" in title:
+            idx = title.rfind("[")
+            duration = html_mod.escape(title[idx+1:-1])
+            title = title[:idx].strip()
+        safe_title = html_mod.escape(title)
+        safe_author = html_mod.escape(v["author"])
+        safe_uploaded = html_mod.escape(v["uploaded"])
+        safe_url = html_mod.escape(v["url"])
+        safe_img = html_mod.escape(v["img"])
+        vid_id = html_mod.escape(v["url"].split("=")[1])
         ret_str += "<div class=\"card\">"
-        ret_str += "<div onclick=\"copyLink('"+v["url"]+"')\">"
-        ret_str += "<img src=\""+v["img"]+"\">"
-        ret_str += "<div class=\"card-title\">"+v["title"]+"</div>"
+        ret_str += "<div onclick=\"copyLink('"+safe_url+"')\">"
+        ret_str += "<img src=\""+safe_img+"\">"
+        ret_str += "<div class=\"card-title\">"+safe_title+"</div>"
         ret_str += "</div>"
-        ret_str += "<div class=\"card-author\">"+v["uploaded"]+"</div>"
+        if duration:
+            ret_str += "<div class=\"card-author\">"+duration+"</div>"
+        ret_str += "<div class=\"card-author\">"+safe_uploaded+"</div>"
         if show_author:
-            ret_str += "<a href=\"/channel/"+ v["author"]+"\"><div class=\"card-author\">"+v["author"]+"</div></a>"
+            ret_str += "<a href=\"/channel/"+ safe_author+"\"><div class=\"card-author\">"+safe_author+"</div></a>"
         if feed_algorithm_btn:
-            ret_str += "<button data-body=\"" + v["url"] + "\" class=\"post-btn\">Feed algorithm</button>"
+            ret_str += "<button data-body=\"" + safe_url + "\" class=\"post-btn\">Feed algorithm</button>"
             ret_str += "<br>"
         if show_remove_from_watch_later_btn:
-            ret_str += "<button data-body=\"" + v["url"].split("=")[1] + "\" class=\"rmwl-btn\">Remove from Watch Later</button>"
+            ret_str += "<button data-body=\"" + vid_id + "\" class=\"rmwl-btn\">Remove from Watch Later</button>"
             ret_str += "<br>"
         else:
-            ret_str += "<button data-body=\"" + v["url"].split("=")[1] + "\" class=\"addwl-btn\">Add to Watch Later</button>"
+            ret_str += "<button data-body=\"" + vid_id + "\" class=\"addwl-btn\">Add to Watch Later</button>"
             ret_str += "<br>"
         if hide_video_btn:
-            ret_str += "<button data-body=\"" + v["url"].split("=")[1] + "\" class=\"hide-btn\">Hide Video</button>"
+            ret_str += "<button data-body=\"" + vid_id + "\" class=\"hide-btn\">Hide Video</button>"
             ret_str += "<br>"
         ret_str += "</div>"
 

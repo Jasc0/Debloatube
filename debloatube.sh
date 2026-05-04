@@ -1,4 +1,5 @@
 #!/bin/env bash
 
-source /home/jake/Build/Debloatube/debloatube/bin/activate
-/bin/env python3 /home/jake/Build/Debloatube/main.py
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/debloatube/bin/activate"
+exec python3 "$SCRIPT_DIR/main.py"
